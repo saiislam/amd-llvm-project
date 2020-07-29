@@ -28,7 +28,13 @@ DEVICE omptarget_device_environmentTy omptarget_device_environment;
 // global data holding OpenMP state information
 ////////////////////////////////////////////////////////////////////////////////
 
+#ifndef __AMDGCN__
 
+DEVICE
+omptarget_nvptx_Queue<omptarget_nvptx_ThreadPrivateContext, OMP_STATE_COUNT>
+    omptarget_nvptx_device_State[MAX_SM];
+
+#else
 __attribute__((used))
 EXTERN uint64_t const constexpr omptarget_nvptx_device_State_size = sizeof(omptarget_nvptx_Queue<omptarget_nvptx_ThreadPrivateContext, OMP_STATE_COUNT>[MAX_SM]);
 
@@ -80,6 +86,7 @@ EXTERN void __devicertl_init_func(void) {
     my_block += WARPSIZE;
   }
 }
+#endif
 
 DEVICE void *omptarget_nest_par_call_stack;
 DEVICE uint32_t omptarget_nest_par_call_struct_size =
