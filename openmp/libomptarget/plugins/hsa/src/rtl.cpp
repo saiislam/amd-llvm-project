@@ -322,6 +322,11 @@ public:
   // OpenMP Requires Flags
   int64_t RequiresFlags;
 
+
+  // Details
+  std::vector<void*> device_state_array;
+
+  
   // static int EnvNumThreads;
   static const int HardTeamLimit = 1 << 20; // 1 Meg
   static const int DefaultNumTeams = 128;
@@ -434,7 +439,10 @@ public:
     WarpSize.resize(NumberOfDevices);
     NumTeams.resize(NumberOfDevices);
     NumThreads.resize(NumberOfDevices);
-
+    device_state_array.resize(NumberOfDevices);
+    for (int i = 0; i < NumberOfDevices; i++) {
+      device_state_array[i] = nullptr;
+    }
     for (int i = 0; i < NumberOfDevices; i++) {
       uint32_t queue_size = 0;
       {
@@ -497,6 +505,12 @@ public:
   ~RTLDeviceInfoTy() {
     DP("Finalizing the HSA-ATMI DeviceInfo.\n");
     KernelArgPoolMap.clear(); // calls hsa to free memory
+    for (size_t i = 0; i < device_state_array.size(); i++) {
+      void *p = device_state_array[i];
+      if (p) {
+        atmi_free(p);
+      }
+    }
     // Terminate hostrpc before finalizing ATMI
     hostrpc_terminate();
     atmi_finalize();
@@ -828,6 +842,68 @@ atmi_status_t module_register_from_memory_to_place(void *module_bytes,
 }
 } // namespace
 
+static uint64_t acquire_available_packet_id(hsa_queue_t *queue) {
+  uint64_t packet_id = hsa_queue_add_write_index_relaxed(queue, 1);
+  bool full = true;
+  while (full) {
+    full =
+        packet_id >= (queue->size + hsa_queue_load_read_index_acquire(queue));
+  }
+  return packet_id;
+}
+
+static void push_barrier_packet(hsa_queue_t *queue) {
+  // barrier bit set to wait for previous tasks to finish
+  // watches no signals and applies no fences itself
+
+  const uint32_t mask = queue->size - 1; // size is a power of 2
+  uint64_t packet_id = acquire_available_packet_id(queue);
+  hsa_barrier_or_packet_t *packet =
+      (hsa_barrier_or_packet_t *)queue->base_address + (packet_id & mask);
+  packet->reserved1 = 0;
+  for (int i = 0; i < 5; i++) {
+    packet->dep_signal[i] = {0};
+  }
+  packet->reserved2 = 0;
+  packet->completion_signal = {0};
+
+  core::packet_store_release(reinterpret_cast<uint32_t *>(packet),
+                             core::create_header(HSA_PACKET_TYPE_BARRIER_OR,
+                                                 /* wait for previous */ 1,
+                                                 /* doesn't touch memory */
+                                                 ATMI_FENCE_SCOPE_NONE,
+                                                 ATMI_FENCE_SCOPE_NONE),
+                             0);
+
+  hsa_signal_store_relaxed(queue->doorbell_signal, packet_id);
+}
+
+static uint64_t get_device_State_bytes(char * ImageStart, size_t img_size)
+{
+  uint64_t device_State_bytes = 0;
+  {
+    // If this is the deviceRTL, get the state variable size
+    symbol_info size_si;
+    int rc = get_symbol_info_without_loading(
+        ImageStart, img_size,
+        "omptarget_nvptx_device_State_size", &size_si);
+
+    if (rc == 0) {
+      if (size_si.size != sizeof(uint64_t)) {
+        fprintf(
+                stderr,   "Found device_State_size variable with wrong size, aborting\n");
+        exit(1);
+      }
+
+      // Read number of bytes directly from the elf
+      memcpy(&device_State_bytes, size_si.addr, sizeof(uint64_t));      
+    }
+  }
+  return device_State_bytes;
+}
+
+static pthread_mutex_t run_target_team_region_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
                                           __tgt_device_image *image) {
   const size_t img_size = (char *)image->ImageEnd - (char *)image->ImageStart;
@@ -840,6 +916,9 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
   if (!elf_machine_id_is_amdgcn(image)) {
     return NULL;
   }
+
+  uint64_t device_State_bytes =
+      get_device_State_bytes((char *)image->ImageStart, img_size);
 
   omptarget_device_environmentTy host_device_env;
   host_device_env.num_devices = DeviceInfo.NumberOfDevices;
@@ -865,10 +944,11 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
     if (si.size != sizeof(host_device_env)) {
       return ATMI_STATUS_ERROR;
     }
-    DP("Setting global device environment %lu bytes\n", si.size);
+    DP("Setting global device environment %u bytes\n", si.size);
     uint64_t offset = (char *)si.addr - (char *)image->ImageStart;
     void *pos = (char *)data + offset;
     memcpy(pos, &host_device_env, sizeof(host_device_env));
+    
     return ATMI_STATUS_SUCCESS;
   };
 
@@ -894,6 +974,108 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
 
   DP("ATMI module successfully loaded!\n");
 
+  {
+    // do this post-load to handle got
+    // TODO: rework control flow to handle missing symbol and skip kernel launch
+    // Could fold the memcpy into the init call, a fine grain alloc is probably
+    // faster than another kernel launch
+    if (device_State_bytes != 0) {
+      void *ptr = NULL;
+      
+      atmi_status_t err =
+          atmi_malloc(&ptr, device_State_bytes, get_gpu_mem_place(device_id));
+      if (err != ATMI_STATUS_SUCCESS) {
+        fprintf(stderr, "Failed to allocate device_state array\n");
+        return NULL;
+      }
+      if (DeviceInfo.device_state_array[device_id] != nullptr) {
+        fprintf(stderr, "Unexpected device_state_array pointer, will leak\n");
+      }
+      DeviceInfo.device_state_array[device_id] = ptr;
+      void *state_ptr;
+      uint32_t state_ptr_size;
+      err = atmi_interop_hsa_get_symbol_info(get_gpu_mem_place(device_id),
+                                    "omptarget_nvptx_device_State", &state_ptr,
+                                    &state_ptr_size);
+
+      if (err != ATMI_STATUS_SUCCESS) {
+        fprintf(stderr, "failed to find device_state ptr\n");
+        return NULL;
+      }
+      if (state_ptr_size != sizeof(void *)) {
+        fprintf(stderr, "unexpected size of state_ptr %u != %u\n",
+                state_ptr_size, sizeof(void *));
+        return NULL;
+      }
+
+      err = atmi_memcpy(state_ptr, &ptr, sizeof(void *));
+      if (err != ATMI_STATUS_SUCCESS) {
+        fprintf(stderr, "memcpy install of state_ptr failed\n");
+        return NULL;
+      }
+    }
+  }
+
+  // Hack here, todo: avoid adding the init function to the openmp kernels list
+  // Zero the pseudo-bss variables by calling __devicertl_init
+  // TODO: Launch the kernel earlier
+
+  if (device_State_bytes != 0) {
+    std::string kernel_name = "__devicertl_init";
+    if (KernelInfoTable[device_id].find(kernel_name) ==
+        KernelInfoTable[device_id].end()) {
+      fprintf(stderr, "Can't find devicertl_init, failing\n");
+      return NULL;
+    }
+
+    // copy/pasting...
+    hsa_queue_t *queue = DeviceInfo.HSAQueues[device_id];
+    uint64_t packet_id = acquire_available_packet_id(queue);
+
+    const uint32_t mask = queue->size - 1; // size is a power of 2
+    hsa_kernel_dispatch_packet_t *packet =
+        (hsa_kernel_dispatch_packet_t *)queue->base_address +
+        (packet_id & mask);
+
+    // read wavesize, init_func_number_blocks from image?
+    const size_t blocks = 31;
+    
+    // packet->header is written last
+    packet->setup = UINT16_C(1) << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS;
+    packet->workgroup_size_x = 64; // threads per wave on gfx9, tasks are independent
+    packet->workgroup_size_y = 1;
+    packet->workgroup_size_z = 1;
+    packet->reserved0 = 0;
+    packet->grid_size_x = packet->workgroup_size_x * blocks; 
+    packet->grid_size_y = 1;
+    packet->grid_size_z = 1;
+    packet->private_segment_size = 0;
+    packet->group_segment_size = 0;
+    packet->kernel_object = 0;
+    packet->kernarg_address = 0; // no args allocated
+    packet->reserved2 = 0;
+    packet->completion_signal = {0};
+
+    // This kernel is known at compiler build time, doesn't need to be in the map
+    {
+      auto it = KernelInfoTable[device_id][kernel_name];
+      packet->kernel_object = it.kernel_object;
+      packet->private_segment_size = it.private_segment_size;
+      packet->group_segment_size = it.group_segment_size;
+      assert(0 == (int)it.num_args);
+    }
+
+    core::packet_store_release(
+        reinterpret_cast<uint32_t *>(packet),
+        core::create_header(HSA_PACKET_TYPE_KERNEL_DISPATCH, 0,
+                            ATMI_FENCE_SCOPE_SYSTEM, ATMI_FENCE_SCOPE_SYSTEM),
+        packet->setup);
+
+    // doorbell run by barrier packet covers the above
+    push_barrier_packet(queue);
+  }
+
+  
   // TODO: Check with Guansong to understand the below comment more thoroughly.
   // Here, we take advantage of the data that is appended after img_end to get
   // the symbols' name we need to load. This data consist of the host entries
@@ -959,7 +1141,7 @@ __tgt_target_table *__tgt_rtl_load_binary(int32_t device_id,
 
       continue;
     }
-
+    
     DP("to find the kernel name: %s size: %lu\n", e->name, strlen(e->name));
 
     atmi_mem_place_t place = get_gpu_mem_place(device_id);
@@ -1401,19 +1583,7 @@ static void *AllocateNestedParallelCallMemory(int MaxParLevel, int NumGroups,
   return TgtPtr; // we need to free this after kernel.
 }
 
-static uint64_t acquire_available_packet_id(hsa_queue_t *queue) {
-  uint64_t packet_id = hsa_queue_add_write_index_relaxed(queue, 1);
-  bool full = true;
-  while (full) {
-    full =
-        packet_id >= (queue->size + hsa_queue_load_read_index_acquire(queue));
-  }
-  return packet_id;
-}
-
 extern bool g_atmi_hostcall_required; // declared without header by atmi
-
-static pthread_mutex_t run_target_team_region_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int32_t __tgt_rtl_run_target_team_region(int32_t device_id, void *tgt_entry_ptr,
                                          void **tgt_args,
@@ -1474,9 +1644,9 @@ int32_t __tgt_rtl_run_target_team_region(int32_t device_id, void *tgt_entry_ptr,
   // Run on the device.
   {
     hsa_queue_t *queue = DeviceInfo.HSAQueues[device_id];
-    uint64_t packet_id = acquire_available_packet_id(queue);
-
     const uint32_t mask = queue->size - 1; // size is a power of 2
+
+    uint64_t packet_id = acquire_available_packet_id(queue);
     hsa_kernel_dispatch_packet_t *packet =
         (hsa_kernel_dispatch_packet_t *)queue->base_address +
         (packet_id & mask);
@@ -1570,7 +1740,7 @@ int32_t __tgt_rtl_run_target_team_region(int32_t device_id, void *tgt_entry_ptr,
 
     core::packet_store_release(
         reinterpret_cast<uint32_t *>(packet),
-        core::create_header(HSA_PACKET_TYPE_KERNEL_DISPATCH, 0,
+        core::create_header(HSA_PACKET_TYPE_KERNEL_DISPATCH, /*barrier*/0,
                             ATMI_FENCE_SCOPE_SYSTEM, ATMI_FENCE_SCOPE_SYSTEM),
         packet->setup);
 

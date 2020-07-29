@@ -133,9 +133,13 @@ INLINE void __kmpc_impl_threadfence_system() {
 }
 
 // Calls to the AMDGCN layer (assuming 1D layout)
+
+__attribute__((used))
 INLINE int GetThreadIdInBlock() { return __builtin_amdgcn_workitem_id_x(); }
+__attribute__((used))
 INLINE int GetBlockIdInKernel() { return __builtin_amdgcn_workgroup_id_x(); }
 DEVICE int GetNumberOfBlocksInKernel();
+__attribute__((used))
 DEVICE int GetNumberOfThreadsInBlock();
 DEVICE unsigned GetWarpId();
 DEVICE unsigned GetLaneId();

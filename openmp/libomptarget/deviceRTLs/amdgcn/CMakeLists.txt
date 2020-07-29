@@ -97,7 +97,9 @@ set(hip_sources
 set(llvm_sources
   ${CMAKE_CURRENT_SOURCE_DIR}/src/atomic_inc.ll)
 set(ocl_sources
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/devicertl_init.cl
   ${CMAKE_CURRENT_SOURCE_DIR}/src/hostrpc_invoke.cl)
+
   
 set(h_files
   ${CMAKE_CURRENT_SOURCE_DIR}/src/amdgcn_interface.h
